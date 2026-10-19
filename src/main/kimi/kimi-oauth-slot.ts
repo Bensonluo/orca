@@ -45,12 +45,25 @@ export function parseKimiActiveOAuthSlot(configText: string): string | null {
   if (typeof parsed !== 'object' || parsed === null) {
     return null
   }
-  const providers = (parsed as { providers?: Record<string, unknown> }).providers
+  if (!('providers' in parsed)) {
+    return null
+  }
+  const providers: unknown = parsed.providers
   if (typeof providers !== 'object' || providers === null) {
     return null
   }
-  const managed = providers['managed:kimi-code'] as { oauth?: { key?: unknown } } | undefined
-  const key = managed?.oauth?.key
+  if (!('managed:kimi-code' in providers)) {
+    return null
+  }
+  const managed: unknown = providers['managed:kimi-code']
+  if (typeof managed !== 'object' || managed === null || !('oauth' in managed)) {
+    return null
+  }
+  const oauth: unknown = managed.oauth
+  if (typeof oauth !== 'object' || oauth === null || !('key' in oauth)) {
+    return null
+  }
+  const key: unknown = oauth.key
   if (typeof key !== 'string') {
     return null
   }

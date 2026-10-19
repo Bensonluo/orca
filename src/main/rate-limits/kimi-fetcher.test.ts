@@ -26,9 +26,9 @@ vi.mock('node:fs/promises', () => ({
     if (fsState.readError) {
       throw fsState.readError
     }
-    const missing = (): NodeJS.ErrnoException => {
-      const error = new Error('ENOENT: no such file or directory') as NodeJS.ErrnoException
-      error.code = 'ENOENT'
+    const missing = (): Error => {
+      const error = new Error('ENOENT: no such file or directory')
+      Object.assign(error, { code: 'ENOENT' })
       return error
     }
     if (p.endsWith('config.toml')) {
@@ -53,25 +53,30 @@ vi.mock('node:fs/promises', () => ({
 vi.mock('node:os', () => ({ homedir: () => '/home/test' }))
 
 import { fetchKimiRateLimits } from './kimi-fetcher'
+import { clearCachedKimiSlot } from './kimi-config-slot'
 
 setMainHttpClient({ fetch: fetchMock, proxySession: () => null })
 
 function jsonResponse(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body
-  } as Response
+  return new Response(JSON.stringify(body), { status })
 }
 
 // Real shape captured from GET https://api.kimi.com/coding/v1/usages.
 const USAGE_RESPONSE = {
   user: { userId: 'u1', membership: { level: 'LEVEL_INTERMEDIATE' } },
-  usage: { limit: '1000', remaining: '1000', resetTime: '2026-06-09T07:52:41.230862Z' },
+  usage: {
+    limit: '1000',
+    remaining: '1000',
+    resetTime: '2026-06-09T07:52:41.230862Z'
+  },
   limits: [
     {
       window: { duration: 300, timeUnit: 'TIME_UNIT_MINUTE' },
-      detail: { limit: '100', remaining: '40', resetTime: '2026-06-04T08:52:41.230862Z' }
+      detail: {
+        limit: '100',
+        remaining: '40',
+        resetTime: '2026-06-04T08:52:41.230862Z'
+      }
     }
   ],
   subType: 'TYPE_PURCHASE'
@@ -92,7 +97,10 @@ function scopedSlotConfig(key: string): string {
 
 function freshCredentials(): string {
   // expires_at far in the future (seconds).
-  return JSON.stringify({ access_token: 'tok-abc', expires_at: 99_999_999_999 })
+  return JSON.stringify({
+    access_token: 'tok-abc',
+    expires_at: 99_999_999_999
+  })
 }
 
 describe('fetchKimiRateLimits', () => {
@@ -104,6 +112,10 @@ describe('fetchKimiRateLimits', () => {
     fsState.missingPaths = []
     fsState.readError = null
     fsState.readPaths = []
+    // Why: the scoped-slot cache lives in the kimi-config-slot module and
+    // survives between polls; tests must not leak discoveries into each other.
+    clearCachedKimiSlot('/home/test/.kimi-code')
+    clearCachedKimiSlot('/custom/kimi-home')
   })
 
   afterEach(() => {
@@ -135,7 +147,7 @@ describe('fetchKimiRateLimits', () => {
     expect(result.weekly?.usedPercent).toBeCloseTo(0)
     // Bearer token from the credentials file is sent.
     const [, init] = fetchMock.mock.calls[0]
-    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok-abc')
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer tok-abc')
   })
 
   it('surfaces an error when the usage request fails', async () => {
@@ -159,7 +171,10 @@ describe('fetchKimiRateLimits', () => {
   it('tags a malformed usage body as a parse failure, not a network one', async () => {
     fsState.credentials = freshCredentials()
     fetchMock.mockResolvedValueOnce(
-      new Response('not json', { status: 200, headers: { 'content-type': 'application/json' } })
+      new Response('not json', {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
     )
 
     const result = await fetchKimiRateLimits()
@@ -198,7 +213,10 @@ describe('fetchKimiRateLimits', () => {
 
   it('does NOT refresh or call the API when the token is expired (read-only)', async () => {
     // expires_at in the past → token stale; fetcher must not hit the network.
-    fsState.credentials = JSON.stringify({ access_token: 'tok-old', expires_at: 1 })
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
 
     const result = await fetchKimiRateLimits()
     expect(result.status).toBe('error')
@@ -218,10 +236,8 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
 
     expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code')
-    ])
+    // A healthy default slot never triggers the config probe.
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code')])
   })
 
   it('honors KIMI_CODE_HOME for the host home', async () => {
@@ -232,10 +248,7 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
 
     expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/custom/kimi-home'),
-      hostCredentialsPath('/custom/kimi-home')
-    ])
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/custom/kimi-home')])
   })
 
   it('ignores a blank KIMI_CODE_HOME instead of reading from the process cwd', async () => {
@@ -245,14 +258,15 @@ describe('fetchKimiRateLimits', () => {
 
     await fetchKimiRateLimits()
 
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code')
-    ])
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code')])
   })
 
-  it('reads the scoped OAuth slot named by config.toml (#24176)', async () => {
+  it('reads the scoped OAuth slot named by config.toml when the default slot is stale (#24176)', async () => {
     const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
     fsState.config = scopedSlotConfig(`oauth/${slot}`)
     fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
       access_token: 'tok-scoped',
@@ -264,16 +278,42 @@ describe('fetchKimiRateLimits', () => {
 
     expect(result.status).toBe('ok')
     expect(fsState.readPaths).toEqual([
+      hostCredentialsPath('/home/test/.kimi-code'),
       hostConfigPath('/home/test/.kimi-code'),
       hostCredentialsPath('/home/test/.kimi-code', slot)
     ])
     const [, init] = fetchMock.mock.calls[0]
-    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok-scoped')
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer tok-scoped')
+  })
+
+  it('caches the scoped slot so later polls skip the probe and the default read', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const first = await fetchKimiRateLimits()
+    expect(first.status).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fsState.readPaths = []
+    const second = await fetchKimiRateLimits()
+    expect(second.status).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    // Steady state for a scoped user: exactly one read, and it is the slot file.
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code', slot)])
   })
 
   it('keeps reading the default slot when config.toml names the shared default key', async () => {
-    // auth.kimi.com users have an explicit `oauth/kimi-code` key; they must not
-    // be redirected anywhere new.
+    // auth.kimi.com users have an explicit `oauth/kimi-code` key. Their default
+    // token is healthy, so the probe never runs and nothing redirects them.
     fsState.config = scopedSlotConfig('oauth/kimi-code')
     fsState.credentials = freshCredentials()
     fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
@@ -281,31 +321,201 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
 
     expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code')
-    ])
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code')])
   })
 
-  it('falls back to the default slot when the scoped slot was never written', async () => {
-    const slot = 'kimi-code-env-0e4f99c69cc27850'
-    fsState.config = scopedSlotConfig(`oauth/${slot}`)
-    fsState.missingPaths = [hostCredentialsPath('/home/test/.kimi-code', slot)]
-    fsState.credentials = freshCredentials()
-    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+  it('reports not signed in when the default slot is absent and config names it anyway', async () => {
+    fsState.config = scopedSlotConfig('oauth/kimi-code')
 
     const result = await fetchKimiRateLimits()
 
-    expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code', slot),
-      hostCredentialsPath('/home/test/.kimi-code')
-    ])
+    // The probe resolves to the default slot, so the outcome matches a plain
+    // missing credentials file — no redirect, no new error mode.
+    expect(result.status).toBe('unavailable')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('drops the cached slot when the file disappears and recovers when it returns', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    const scopedPath = hostCredentialsPath('/home/test/.kimi-code', slot)
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const first = await fetchKimiRateLimits()
+    expect(first.status).toBe('ok')
+
+    // The CLI removes the environment: cached read goes missing, cache drops,
+    // and the user falls back to the default slot's expired error.
+    delete fsState.credentialsByPath[scopedPath]
+    fsState.missingPaths = [scopedPath]
+    const second = await fetchKimiRateLimits()
+    expect(second.status).toBe('error')
+    expect(second.error).toMatch(/expired/i)
+
+    // Self-heals without a restart once the file is back.
+    fsState.missingPaths = []
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    const third = await fetchKimiRateLimits()
+    expect(third.status).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops the cached slot when its token goes stale and re-derives on the same poll', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    const scopedPath = hostCredentialsPath('/home/test/.kimi-code', slot)
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const first = await fetchKimiRateLimits()
+    expect(first.status).toBe('ok')
+
+    // Token expires between polls while the file stays put: the cached slot is
+    // dropped and the poll re-derives instead of sticking to a dead slot.
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 1
+    })
+    const second = await fetchKimiRateLimits()
+    expect(second.status).toBe('error')
+    expect(second.error).toMatch(/expired/i)
+    expect(second.usageMetadata?.failureKind).toBe('delegated-refresh-required')
+
+    // And it re-caches once the CLI refreshes the file.
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped-2',
+      expires_at: 99_999_999_999
+    })
+    const third = await fetchKimiRateLimits()
+    expect(third.status).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls back to the default result when the scoped file is corrupt', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = 'not json'
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('error')
+    expect(result.error).toMatch(/expired/i)
+    expect(fetchMock).not.toHaveBeenCalled()
+    // A corrupt scoped file must not be cached: the next poll re-derives.
+    fsState.readPaths = []
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+    const recovered = await fetchKimiRateLimits()
+    expect(recovered.status).toBe('ok')
+  })
+
+  it('scopes the slot cache per home', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const scopedResult = await fetchKimiRateLimits()
+    expect(scopedResult.status).toBe('ok')
+
+    // A different home must not inherit the first home's cached slot.
+    vi.stubEnv('KIMI_CODE_HOME', '/custom/kimi-home')
+    fsState.credentials = freshCredentials()
+    fsState.readPaths = []
+    const defaultResult = await fetchKimiRateLimits()
+    expect(defaultResult.status).toBe('ok')
+    expect(fsState.readPaths).toEqual([hostCredentialsPath('/custom/kimi-home')])
+  })
+
+  it('shares one config read between concurrent discovery polls', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const [first, second] = await Promise.all([fetchKimiRateLimits(), fetchKimiRateLimits()])
+
+    expect(first.status).toBe('ok')
+    expect(second.status).toBe('ok')
+    const configReads = fsState.readPaths.filter(
+      (path) => path === hostConfigPath('/home/test/.kimi-code')
+    )
+    expect(configReads).toHaveLength(1)
+    for (const call of fetchMock.mock.calls) {
+      expect(new Headers(call[1].headers).get('Authorization')).toBe('Bearer tok-scoped')
+    }
+  })
+
+  it('falls back to the default result when the scoped slot was never written', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.missingPaths = [hostCredentialsPath('/home/test/.kimi-code', slot)]
+
+    const result = await fetchKimiRateLimits()
+
+    // The default slot's expired error stays actionable; nothing was cached.
+    expect(result.status).toBe('error')
+    expect(result.error).toMatch(/expired/i)
+    fsState.readPaths = []
+    fsState.missingPaths = []
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+    const recovered = await fetchKimiRateLimits()
+    expect(recovered.status).toBe('ok')
   })
 
   it('does NOT fall back to the default slot when the scoped token is expired', async () => {
     const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old-default',
+      expires_at: 1
+    })
     fsState.config = scopedSlotConfig(`oauth/${slot}`)
     fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
       access_token: 'tok-old',
@@ -317,11 +527,6 @@ describe('fetchKimiRateLimits', () => {
     expect(result.status).toBe('error')
     expect(result.error).toMatch(/expired/i)
     expect(result.usageMetadata?.failureKind).toBe('delegated-refresh-required')
-    // Only the scoped file was consulted — no silent fallback to another account's token.
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code', slot)
-    ])
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -335,16 +540,18 @@ describe('fetchKimiRateLimits', () => {
       '[providers."managed:kimi-code".oauth]\nkey = "oauth/../../other"\n'
     ]
   ])('keeps the default slot when config.toml has %s', async (_label: string, config: string) => {
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
     fsState.config = config
-    fsState.credentials = freshCredentials()
-    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
 
     const result = await fetchKimiRateLimits()
 
-    expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([
-      hostConfigPath('/home/test/.kimi-code'),
-      hostCredentialsPath('/home/test/.kimi-code')
-    ])
+    // Probe resolves to the default slot on any parse/validation failure, so
+    // the user keeps the actionable expired-token error instead of a redirect.
+    expect(result.status).toBe('error')
+    expect(result.error).toMatch(/expired/i)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })
