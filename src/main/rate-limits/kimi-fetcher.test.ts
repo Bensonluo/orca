@@ -4,25 +4,47 @@ import { setMainHttpClient } from '../network/http-client'
 
 const fetchMock = vi.fn()
 const fsState = vi.hoisted<{
+  config: string | null
   credentials: string | null
+  credentialsByPath: Record<string, string>
+  missingPaths: string[]
   readError: Error | null
   readPaths: string[]
 }>(() => ({
+  config: null,
   credentials: null,
+  credentialsByPath: {},
+  missingPaths: [],
   readError: null,
   readPaths: []
 }))
 
 vi.mock('node:fs/promises', () => ({
   readFile: async (path: string) => {
-    fsState.readPaths.push(String(path))
+    const p = String(path)
+    fsState.readPaths.push(p)
     if (fsState.readError) {
       throw fsState.readError
     }
-    if (fsState.credentials === null) {
+    const missing = (): NodeJS.ErrnoException => {
       const error = new Error('ENOENT: no such file or directory') as NodeJS.ErrnoException
       error.code = 'ENOENT'
-      throw error
+      return error
+    }
+    if (p.endsWith('config.toml')) {
+      if (fsState.config === null) {
+        throw missing()
+      }
+      return fsState.config
+    }
+    if (fsState.missingPaths.includes(p)) {
+      throw missing()
+    }
+    if (p in fsState.credentialsByPath) {
+      return fsState.credentialsByPath[p]
+    }
+    if (fsState.credentials === null) {
+      throw missing()
     }
     return fsState.credentials
   }
@@ -56,8 +78,16 @@ const USAGE_RESPONSE = {
 }
 
 // Built with `join` so the expectation matches the separator the fetcher emits on this platform.
-function hostCredentialsPath(kimiHome: string): string {
-  return join(kimiHome, 'credentials', 'kimi-code.json')
+function hostConfigPath(kimiHome: string): string {
+  return join(kimiHome, 'config.toml')
+}
+
+function hostCredentialsPath(kimiHome: string, slot = 'kimi-code'): string {
+  return join(kimiHome, 'credentials', `${slot}.json`)
+}
+
+function scopedSlotConfig(key: string): string {
+  return `[providers."managed:kimi-code".oauth]\nstorage = "file"\nkey = "${key}"\noauth_host = "https://auth.kimi.ai"\n`
 }
 
 function freshCredentials(): string {
@@ -68,7 +98,10 @@ function freshCredentials(): string {
 describe('fetchKimiRateLimits', () => {
   beforeEach(() => {
     fetchMock.mockReset()
+    fsState.config = null
     fsState.credentials = null
+    fsState.credentialsByPath = {}
+    fsState.missingPaths = []
     fsState.readError = null
     fsState.readPaths = []
   })
@@ -185,7 +218,10 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
 
     expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code')])
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code')
+    ])
   })
 
   it('honors KIMI_CODE_HOME for the host home', async () => {
@@ -196,7 +232,10 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
 
     expect(result.status).toBe('ok')
-    expect(fsState.readPaths).toEqual([hostCredentialsPath('/custom/kimi-home')])
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/custom/kimi-home'),
+      hostCredentialsPath('/custom/kimi-home')
+    ])
   })
 
   it('ignores a blank KIMI_CODE_HOME instead of reading from the process cwd', async () => {
@@ -206,6 +245,106 @@ describe('fetchKimiRateLimits', () => {
 
     await fetchKimiRateLimits()
 
-    expect(fsState.readPaths).toEqual([hostCredentialsPath('/home/test/.kimi-code')])
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code')
+    ])
+  })
+
+  it('reads the scoped OAuth slot named by config.toml (#24176)', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('ok')
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code', slot)
+    ])
+    const [, init] = fetchMock.mock.calls[0]
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok-scoped')
+  })
+
+  it('keeps reading the default slot when config.toml names the shared default key', async () => {
+    // auth.kimi.com users have an explicit `oauth/kimi-code` key; they must not
+    // be redirected anywhere new.
+    fsState.config = scopedSlotConfig('oauth/kimi-code')
+    fsState.credentials = freshCredentials()
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('ok')
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code')
+    ])
+  })
+
+  it('falls back to the default slot when the scoped slot was never written', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.missingPaths = [hostCredentialsPath('/home/test/.kimi-code', slot)]
+    fsState.credentials = freshCredentials()
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('ok')
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code', slot),
+      hostCredentialsPath('/home/test/.kimi-code')
+    ])
+  })
+
+  it('does NOT fall back to the default slot when the scoped token is expired', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[hostCredentialsPath('/home/test/.kimi-code', slot)] = JSON.stringify({
+      access_token: 'tok-old',
+      expires_at: 1
+    })
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('error')
+    expect(result.error).toMatch(/expired/i)
+    expect(result.usageMetadata?.failureKind).toBe('delegated-refresh-required')
+    // Only the scoped file was consulted — no silent fallback to another account's token.
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code', slot)
+    ])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['missing providers section', '[oauth]\nkey = "oauth/kimi-code-env-abc"\n'],
+    ['malformed toml', 'this is [not toml'],
+    ['key is not a string', '[providers."managed:kimi-code".oauth]\nkey = 42\n'],
+    ['key has no oauth prefix', '[providers."managed:kimi-code".oauth]\nkey = "custom-slot"\n'],
+    [
+      'key tries to escape the credentials dir',
+      '[providers."managed:kimi-code".oauth]\nkey = "oauth/../../other"\n'
+    ]
+  ])('keeps the default slot when config.toml has %s', async (_label: string, config: string) => {
+    fsState.config = config
+    fsState.credentials = freshCredentials()
+    fetchMock.mockResolvedValueOnce(jsonResponse(USAGE_RESPONSE))
+
+    const result = await fetchKimiRateLimits()
+
+    expect(result.status).toBe('ok')
+    expect(fsState.readPaths).toEqual([
+      hostConfigPath('/home/test/.kimi-code'),
+      hostCredentialsPath('/home/test/.kimi-code')
+    ])
   })
 })

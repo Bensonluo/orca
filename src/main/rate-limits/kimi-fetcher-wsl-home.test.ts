@@ -129,7 +129,10 @@ describe('fetchKimiRateLimits with a WSL credentials home', () => {
     const pending = fetchKimiRateLimits({
       home: { runtime: 'wsl', wslDistro: 'Stopped', path: stalledHome }
     })
-    expect(timeout).toHaveBeenCalledWith(5_000)
+    // Why: the fetcher first probes config.toml for the active OAuth slot
+    // (#24176); wait until that read settles and the bounded credentials read
+    // arms its AbortSignal.timeout.
+    await vi.waitFor(() => expect(timeout).toHaveBeenCalledWith(5_000))
     await Promise.resolve()
     await Promise.resolve()
     timeoutController.abort()

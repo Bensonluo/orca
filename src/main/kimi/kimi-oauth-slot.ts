@@ -1,0 +1,70 @@
+import { readFile } from 'node:fs/promises'
+import { join, win32 as pathWin32 } from 'node:path'
+import { parse as parseToml } from 'smol-toml'
+import { parseWslUncPath } from '../../shared/wsl-paths'
+
+// The CLI's default shared environment persists its token in the
+// `kimi-code` slot; Kimi Code 2.x scoped environments (for example
+// `auth.kimi.ai` / `api.kimi.ai`, the default for the `mainland-cn` region)
+// persist under `kimi-code-env-<hash>` slots instead (#24176).
+export const DEFAULT_KIMI_OAUTH_SLOT = 'kimi-code'
+
+function joinKimiPath(kimiHome: string, ...segments: string[]): string {
+  // WSL homes arrive as `\\wsl.localhost\<distro>\...`, which only win32 join keeps intact.
+  return parseWslUncPath(kimiHome)
+    ? pathWin32.join(kimiHome, ...segments)
+    : join(kimiHome, ...segments)
+}
+
+export function getKimiConfigPath(kimiHome: string): string {
+  return joinKimiPath(kimiHome, 'config.toml')
+}
+
+export function getKimiCredentialsPath(kimiHome: string, slot: string): string {
+  return joinKimiPath(kimiHome, 'credentials', `${slot}.json`)
+}
+
+// Mirrors the CLI's `resolveKimiCodeOAuthKey` slot naming: the active key is
+// `oauth/<slot name>`, stored in config.toml as
+// [providers."managed:kimi-code".oauth].key. The charset excludes separators so
+// a crafted key can never escape the credentials directory.
+const OAUTH_KEY_PATTERN = /^oauth\/([A-Za-z0-9._-]+)$/
+
+export function parseKimiActiveOAuthSlot(configText: string): string | null {
+  let parsed: unknown
+  try {
+    parsed = parseToml(configText)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return null
+  }
+  const providers = (parsed as { providers?: Record<string, unknown> }).providers
+  if (typeof providers !== 'object' || providers === null) {
+    return null
+  }
+  const managed = providers['managed:kimi-code'] as { oauth?: { key?: unknown } } | undefined
+  const key = managed?.oauth?.key
+  if (typeof key !== 'string') {
+    return null
+  }
+  const match = OAUTH_KEY_PATTERN.exec(key)
+  return match ? match[1] : null
+}
+
+/**
+ * Which OAuth slot the CLI currently signs tokens into, or null when config.toml
+ * is absent/unreadable/malformed or names no usable key. Callers must treat null
+ * as "keep the historical default" so users of the shared default environment
+ * (auth.kimi.com) are unaffected.
+ */
+export async function readKimiActiveOAuthSlot(kimiHome: string): Promise<string | null> {
+  let raw: string
+  try {
+    raw = await readFile(getKimiConfigPath(kimiHome), 'utf-8')
+  } catch {
+    return null
+  }
+  return parseKimiActiveOAuthSlot(raw)
+}

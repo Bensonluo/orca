@@ -1,13 +1,16 @@
 import { readFile } from 'node:fs/promises'
-import { join, win32 as pathWin32 } from 'node:path'
 import { getMainHttpClient } from '../network/http-client'
 import type {
   ProviderRateLimits,
   RateLimitWindow,
   UsageRateLimitMetadata
 } from '../../shared/rate-limit-types'
-import { parseWslUncPath } from '../../shared/wsl-paths'
 import { getHostKimiHome, type KimiHomeResolution } from '../kimi/kimi-runtime-home'
+import {
+  DEFAULT_KIMI_OAUTH_SLOT,
+  getKimiCredentialsPath,
+  readKimiActiveOAuthSlot
+} from '../kimi/kimi-oauth-slot'
 import {
   createAuthFilesystemOperation,
   type SharedAuthFilesystemOperation
@@ -24,13 +27,6 @@ const CREDENTIALS_READ_TIMEOUT_MS = 5_000
 
 const SESSION_WINDOW_MINUTES = 300 // 5h
 const WEEKLY_WINDOW_MINUTES = 10080 // 7d
-
-function getCredentialsPath(kimiHome: string): string {
-  // WSL homes arrive as `\\wsl.localhost\<distro>\...`, which only win32 join keeps intact.
-  return parseWslUncPath(kimiHome)
-    ? pathWin32.join(kimiHome, 'credentials', 'kimi-code.json')
-    : join(kimiHome, 'credentials', 'kimi-code.json')
-}
 
 type KimiCredentials = {
   access_token?: string
@@ -107,8 +103,7 @@ function getCredentialsRead(path: string): SharedAuthFilesystemOperation<Credent
   return read
 }
 
-async function readCredentials(kimiHome: string): Promise<CredentialsReadResult> {
-  const path = getCredentialsPath(kimiHome)
+async function readCredentialsAt(path: string): Promise<CredentialsReadResult> {
   try {
     // Why: a stopped distro parks a UNC read for minutes; bound it so a WSL home
     // degrades to an error instead of stalling the poll cycle.
@@ -116,6 +111,19 @@ async function readCredentials(kimiHome: string): Promise<CredentialsReadResult>
   } catch (err) {
     return { status: 'error', error: readErrorMessage(err) }
   }
+}
+
+async function readCredentials(kimiHome: string): Promise<CredentialsReadResult> {
+  const slot = (await readKimiActiveOAuthSlot(kimiHome)) ?? DEFAULT_KIMI_OAUTH_SLOT
+  const scoped = await readCredentialsAt(getKimiCredentialsPath(kimiHome, slot))
+  // Why: only fall back when the scoped slot was never written. An existing but
+  // expired scoped token must surface the delegated-refresh error instead of
+  // silently reading a stale token from the default slot, which may belong to a
+  // different Kimi account.
+  if (scoped.status === 'missing' && slot !== DEFAULT_KIMI_OAUTH_SLOT) {
+    return readCredentialsAt(getKimiCredentialsPath(kimiHome, DEFAULT_KIMI_OAUTH_SLOT))
+  }
+  return scoped
 }
 
 function isAccessTokenFresh(creds: KimiCredentials): boolean {
@@ -295,8 +303,10 @@ function result(
  * often runs inside WSL, and only that copy is refreshed (#12370). Defaults to
  * the host home.
  *
- * Why read-only: the access token lives in `<kimi home>/credentials/kimi-code.json`
- * and is refreshed by the Kimi CLI itself (15-min TTL, refresh-token rotation).
+ * Why read-only: the access token lives in `<kimi home>/credentials/<slot>.json`
+ * (the active slot is resolved from `[providers."managed:kimi-code"].oauth.key`
+ * in `<kimi home>/config.toml`, defaulting to `kimi-code`) and is refreshed by
+ * the Kimi CLI itself (15-min TTL, refresh-token rotation).
  * Orca must NEVER refresh or rewrite that file — a rotated refresh token would
  * log out a live `kimi` session. We only read the current token and call the
  * same `GET /usages` endpoint, with the same headers, that the CLI's own
