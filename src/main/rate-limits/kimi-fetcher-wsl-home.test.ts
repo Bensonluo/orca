@@ -120,6 +120,31 @@ describe('fetchKimiRateLimits with a WSL credentials home', () => {
 
   // Last: an unsettled UNC read stays shared for its path by design, so the stalled
   // distro gets its own home to avoid poisoning the other cases.
+  it('bounds a stalled config.toml read instead of parking the poll cycle', async () => {
+    const stalledHome = '\\\\wsl.localhost\\StoppedCfg\\home\\neil\\.kimi-code'
+    files.set(`${stalledHome}\\config.toml`, STALLED)
+    files.set(`${stalledHome}\\credentials\\kimi-code.json`, credentials('tok-after-stall', 3600))
+    const timeoutController = new AbortController()
+    // Only the config read's timeout is faked; the credentials read keeps the
+    // real AbortSignal.timeout so it resolves normally once reached.
+    const timeout = vi
+      .spyOn(AbortSignal, 'timeout')
+      .mockImplementationOnce(() => timeoutController.signal)
+
+    const pending = fetchKimiRateLimits({
+      home: { runtime: 'wsl', wslDistro: 'StoppedCfg', path: stalledHome }
+    })
+    await vi.waitFor(() => expect(timeout).toHaveBeenCalledTimes(1))
+    timeoutController.abort()
+
+    const result = await pending
+    expect(result.error).toBeNull()
+    expect(result.status).toBe('ok')
+    expect(result.session).not.toBeNull()
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe('Bearer tok-after-stall')
+    timeout.mockRestore()
+  })
+
   it('bounds a stalled UNC read instead of parking the poll cycle', async () => {
     const stalledHome = '\\\\wsl.localhost\\Stopped\\home\\neil\\.kimi-code'
     files.set(`${stalledHome}\\credentials\\kimi-code.json`, STALLED)

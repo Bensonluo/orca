@@ -6,11 +6,8 @@ import type {
   UsageRateLimitMetadata
 } from '../../shared/rate-limit-types'
 import { getHostKimiHome, type KimiHomeResolution } from '../kimi/kimi-runtime-home'
-import {
-  DEFAULT_KIMI_OAUTH_SLOT,
-  getKimiCredentialsPath,
-  readKimiActiveOAuthSlot
-} from '../kimi/kimi-oauth-slot'
+import { DEFAULT_KIMI_OAUTH_SLOT, getKimiCredentialsPath } from '../kimi/kimi-oauth-slot'
+import { readKimiActiveOAuthSlot } from './kimi-config-slot'
 import {
   createAuthFilesystemOperation,
   type SharedAuthFilesystemOperation

@@ -101,7 +101,8 @@ function scheduleWslAuthFilesystemOperation<T>(
 function scheduleAuthFilesystemOperation<T>(
   authPath: string,
   neededSignal: AbortSignal,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  concurrencyGroup?: string
 ): Promise<T> {
   const wslInfo = parseWslUncPath(authPath)
   if (!wslInfo) {
@@ -115,8 +116,11 @@ function scheduleAuthFilesystemOperation<T>(
   // Why: a few disconnected distros must not occupy libuv's entire default
   // filesystem pool. Distro serialization also folds wsl$/wsl.localhost and
   // case aliases without forcing healthy local auth reads through the queue.
+  // The group prefix lets related-but-independent probes (e.g. a config slot
+  // probe versus the credential read) serialize separately so one stalled
+  // read of a kind cannot starve the other kind for the same distro.
   return scheduleWslAuthFilesystemOperation(
-    wslInfo.distro.trim().toLowerCase(),
+    `${concurrencyGroup ?? 'auth'}:${wslInfo.distro.trim().toLowerCase()}`,
     neededSignal,
     operation
   )
@@ -134,12 +138,18 @@ export type SharedAuthFilesystemOperation<T> = {
  */
 export function createAuthFilesystemOperation<T>(
   authPath: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  options?: { concurrencyGroup?: string }
 ): SharedAuthFilesystemOperation<T> {
   const neededController = new AbortController()
   const waiters = new Set<symbol>()
   let settled = false
-  const result = scheduleAuthFilesystemOperation(authPath, neededController.signal, operation)
+  const result = scheduleAuthFilesystemOperation(
+    authPath,
+    neededController.signal,
+    operation,
+    options?.concurrencyGroup
+  )
   const settlementWaiters = new PromiseSettlementWaiters(result, () => {
     settled = true
   })

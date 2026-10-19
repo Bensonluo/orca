@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises'
 import { join, win32 as pathWin32 } from 'node:path'
 import { parse as parseToml } from 'smol-toml'
 import { parseWslUncPath } from '../../shared/wsl-paths'
@@ -30,6 +29,12 @@ export function getKimiCredentialsPath(kimiHome: string, slot: string): string {
 // a crafted key can never escape the credentials directory.
 const OAUTH_KEY_PATTERN = /^oauth\/([A-Za-z0-9._-]+)$/
 
+/**
+ * Parse the active OAuth slot out of a config.toml body. Returns null when the
+ * text is malformed or names no usable key; callers must treat null as "keep
+ * the historical default" so users of the shared default environment
+ * (auth.kimi.com) are unaffected.
+ */
 export function parseKimiActiveOAuthSlot(configText: string): string | null {
   let parsed: unknown
   try {
@@ -51,20 +56,4 @@ export function parseKimiActiveOAuthSlot(configText: string): string | null {
   }
   const match = OAUTH_KEY_PATTERN.exec(key)
   return match ? match[1] : null
-}
-
-/**
- * Which OAuth slot the CLI currently signs tokens into, or null when config.toml
- * is absent/unreadable/malformed or names no usable key. Callers must treat null
- * as "keep the historical default" so users of the shared default environment
- * (auth.kimi.com) are unaffected.
- */
-export async function readKimiActiveOAuthSlot(kimiHome: string): Promise<string | null> {
-  let raw: string
-  try {
-    raw = await readFile(getKimiConfigPath(kimiHome), 'utf-8')
-  } catch {
-    return null
-  }
-  return parseKimiActiveOAuthSlot(raw)
 }
