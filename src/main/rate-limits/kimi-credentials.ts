@@ -132,10 +132,13 @@ export async function readCredentials(kimiHome: string): Promise<CredentialsRead
   const cached = getCachedKimiSlot(kimiHome)
   if (cached) {
     const scoped = await readCredentialsAt(getKimiCredentialsPath(kimiHome, cached))
-    if (scoped.status === 'ok' && isAccessTokenFresh(scoped.credentials)) {
+    // Why: same precedence as discovery below — a scoped file that exists wins
+    // even with an expired token; its delegated-refresh error beats a fresh
+    // default token that may belong to a different account (#24176).
+    if (scoped.status === 'ok') {
       return scoped
     }
-    // Stale or unreadable cached slot: drop it and rediscover below.
+    // Missing or unreadable cached slot: drop it and rediscover below.
     clearCachedKimiSlot(kimiHome)
   }
   const fallback = await readCredentialsAt(

@@ -10,8 +10,8 @@ const CONFIG_READ_TIMEOUT_MS = 5_000
 /**
  * Scoped slots discovered per Kimi home, so steady-state polls read exactly
  * one file (the active slot) instead of probing config.toml every cycle. The
- * cache is best-effort: callers drop an entry as soon as the cached slot
- * stops yielding a fresh token, and lazy re-discovery is one poll away.
+ * cache is best-effort: callers drop an entry as soon as its slot file stops
+ * yielding credentials, and lazy re-discovery is one poll away.
  */
 const activeSlotByHome = new Map<string, string>()
 

@@ -371,7 +371,7 @@ describe('fetchKimiRateLimits', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  it('drops the cached slot when its token goes stale and re-derives on the same poll', async () => {
+  it('keeps serving the cached scoped slot when its token goes stale', async () => {
     const slot = 'kimi-code-env-0e4f99c69cc27850'
     const scopedPath = hostCredentialsPath('/home/test/.kimi-code', slot)
     fsState.credentials = JSON.stringify({
@@ -388,18 +388,22 @@ describe('fetchKimiRateLimits', () => {
     const first = await fetchKimiRateLimits()
     expect(first.status).toBe('ok')
 
-    // Token expires between polls while the file stays put: the cached slot is
-    // dropped and the poll re-derives instead of sticking to a dead slot.
+    // Token expires between polls while the file stays put: the scoped slot
+    // keeps precedence and surfaces its own delegated-refresh error instead of
+    // redirecting to a default token that may belong to another account.
     fsState.credentialsByPath[scopedPath] = JSON.stringify({
       access_token: 'tok-scoped',
       expires_at: 1
     })
+    fsState.readPaths = []
     const second = await fetchKimiRateLimits()
     expect(second.status).toBe('error')
     expect(second.error).toMatch(/expired/i)
     expect(second.usageMetadata?.failureKind).toBe('delegated-refresh-required')
+    // One read per poll, still only the slot file.
+    expect(fsState.readPaths).toEqual([scopedPath])
 
-    // And it re-caches once the CLI refreshes the file.
+    // And it recovers once the CLI refreshes the file.
     fsState.credentialsByPath[scopedPath] = JSON.stringify({
       access_token: 'tok-scoped-2',
       expires_at: 99_999_999_999
@@ -483,6 +487,52 @@ describe('fetchKimiRateLimits', () => {
     for (const call of fetchMock.mock.calls) {
       expect(new Headers(call[1].headers).get('Authorization')).toBe('Bearer tok-scoped')
     }
+  })
+
+  it('does NOT fall back to a fresh default token when the cached scoped token is stale', async () => {
+    const slot = 'kimi-code-env-0e4f99c69cc27850'
+    const scopedPath = hostCredentialsPath('/home/test/.kimi-code', slot)
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-old-default',
+      expires_at: 1
+    })
+    fsState.config = scopedSlotConfig(`oauth/${slot}`)
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 99_999_999_999
+    })
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(USAGE_RESPONSE)))
+
+    const first = await fetchKimiRateLimits()
+    expect(first.status).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // The default file rotates again with a fresh token — possibly another
+    // account — while the scoped token expires: the cached scoped slot keeps
+    // precedence, surfacing its delegated-refresh error instead of silently
+    // querying usage with the wrong account's token.
+    fsState.credentials = JSON.stringify({
+      access_token: 'tok-default-fresh',
+      expires_at: 99_999_999_999
+    })
+    fsState.credentialsByPath[scopedPath] = JSON.stringify({
+      access_token: 'tok-scoped',
+      expires_at: 1
+    })
+    fsState.readPaths = []
+    const second = await fetchKimiRateLimits()
+    expect(second.status).toBe('error')
+    expect(second.error).toMatch(/expired/i)
+    expect(second.usageMetadata?.failureKind).toBe('delegated-refresh-required')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    // Steady state holds: one read, and it is the cached slot file.
+    expect(fsState.readPaths).toEqual([scopedPath])
+
+    // The default file disappearing changes nothing: the scoped slot stands.
+    fsState.missingPaths = [hostCredentialsPath('/home/test/.kimi-code')]
+    const third = await fetchKimiRateLimits()
+    expect(third.status).toBe('error')
+    expect(third.usageMetadata?.failureKind).toBe('delegated-refresh-required')
   })
 
   it('falls back to the default result when the scoped slot was never written', async () => {
